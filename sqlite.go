@@ -2,6 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Copyright (C) 2014 Yasuhiro Matsumoto <mattn.jp@gmail.com>.
+//
+// Use of the datetime and compatibility related parts of this
+// source code is governed by an MIT-style
+// license that can be found in the LICENSE_MATTN file.
+
 //TODO Pinger (tags go1.8)
 
 //go:generate go run generator.go
@@ -54,8 +60,10 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -96,10 +104,12 @@ var (
 	vm     *virtual.Machine
 
 	// FFI
+
 	bindBlob            int
 	bindDouble          int
 	bindInt             int
 	bindInt64           int
+	bindNull            int
 	bindParameterCount  int
 	bindText            int
 	changes             int
@@ -107,6 +117,7 @@ var (
 	columnBlob          int
 	columnBytes         int
 	columnCount         int
+	columnDeclType      int
 	columnDouble        int
 	columnInt64         int
 	columnName          int
@@ -119,11 +130,30 @@ var (
 	finalize            int
 	free                int
 	lastInsertRowID     int
+	libVersion          int
+	libVersionNumber    int
 	maloc               int
 	openV2              int
 	prepareV2           int
+	sourceID            int
 	step                int
 )
+
+// required for the ?mattn compatibility option:
+// https://github.com/mattn/go-sqlite3/blob/46e826d22aebbfda29523e86e3114c2beb4dab43/sqlite3.go#L126-L137
+var MattnTimestampFormats = []string{
+	// By default, store timestamps with whatever timezone they come with.
+	// When parsed, they will be returned with the same timezone.
+	"2006-01-02 15:04:05.999999999-07:00",
+	"2006-01-02T15:04:05.999999999-07:00",
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04",
+	"2006-01-02T15:04",
+	"2006-01-02",
+}
 
 func init() {
 	b0 := bytes.NewBufferString(bin.Data)
@@ -158,6 +188,7 @@ func init() {
 		{&bindDouble, "sqlite3_bind_double"},
 		{&bindInt, "sqlite3_bind_int"},
 		{&bindInt64, "sqlite3_bind_int64"},
+		{&bindNull, "sqlite3_bind_null"},
 		{&bindParameterCount, "sqlite3_bind_parameter_count"},
 		{&bindText, "sqlite3_bind_text"},
 		{&changes, "sqlite3_changes"},
@@ -165,6 +196,7 @@ func init() {
 		{&columnBlob, "sqlite3_column_blob"},
 		{&columnBytes, "sqlite3_column_bytes"},
 		{&columnCount, "sqlite3_column_count"},
+		{&columnDeclType, "sqlite3_column_decltype"},
 		{&columnDouble, "sqlite3_column_double"},
 		{&columnInt64, "sqlite3_column_int64"},
 		{&columnName, "sqlite3_column_name"},
@@ -189,6 +221,11 @@ func init() {
 	}
 
 	sql.Register(driverName, newDrv())
+}
+
+// Version returns the version of the underlying SQLite library
+func Version() (string, int, string) {
+	return bin.XSQLITE_VERSION, int(bin.XSQLITE_VERSION_NUMBER), bin.XSQLITE_SOURCE_ID
 }
 
 func tracer(rx interface{}, format string, args ...interface{}) {
@@ -363,8 +400,33 @@ func (r *rows) Next(dest []driver.Value) (err error) {
 				if err != nil {
 					return err
 				}
-
 				dest[i] = v
+
+				if r.conn.compatibility {
+					cty, err := r.columnDeclType(i)
+					if err != nil {
+						return err
+					}
+					switch cty {
+					case "timestamp", "datetime", "date":
+
+						var t time.Time
+						// Assume a millisecond unix timestamp if it's 13 digits -- too
+						// large to be a reasonable timestamp in seconds.
+						scale := time.Second
+						if v > 1e12 || v < -1e12 {
+							scale = time.Millisecond
+						}
+						v *= int64(scale)
+						t = time.Unix(0, v).UTC()
+						if r.conn.loc != nil {
+							t = t.In(r.conn.loc)
+						}
+						dest[i] = t
+					case "boolean":
+						dest[i] = v > 0
+					}
+				}
 			case bin.XSQLITE_FLOAT:
 				v, err := r.columnDouble(i)
 				if err != nil {
@@ -377,8 +439,35 @@ func (r *rows) Next(dest []driver.Value) (err error) {
 				if err != nil {
 					return err
 				}
-
 				dest[i] = v
+
+				if r.conn.compatibility {
+					cty, err := r.columnDeclType(i)
+					if err != nil {
+						return err
+					}
+					switch cty {
+					case "timestamp", "datetime", "date":
+						var err error
+						var t time.Time
+						v = strings.TrimSuffix(v, "Z")
+						for _, format := range MattnTimestampFormats {
+							if t, err = time.ParseInLocation(format, v, time.UTC); err == nil {
+								break
+							}
+						}
+						if err != nil {
+							// The column is a time value, so return the zero time on parse failure.
+							t = time.Time{}
+						}
+
+						if r.conn.loc != nil {
+							t = t.In(r.conn.loc)
+						}
+
+						dest[i] = t
+					}
+				}
 			case bin.XSQLITE_BLOB:
 				v, err := r.columnBlob(i)
 				if err != nil {
@@ -506,6 +595,21 @@ func (r *rows) columnName(n int) (string, error) {
 	}
 
 	return virtual.GoString(p), nil
+}
+
+// const char *sqlite3_column_decltype(sqlite3_stmt*, int N);
+// columnDeclType always returns the type name in lowercase
+func (r *rows) columnDeclType(n int) (string, error) {
+	var p uintptr
+	if _, err := r.FFI1(
+		columnDeclType,
+		virtual.PtrResult{&p},
+		virtual.Ptr(r.pstmt), virtual.Int32(n),
+	); err != nil {
+		return "", err
+	}
+
+	return strings.ToLower(virtual.GoString(p)), nil
 }
 
 type stmt struct {
@@ -715,6 +819,24 @@ func (s *stmt) Query(args []driver.Value) (r driver.Rows, err error) {
 	return newRows(s, rowStmt, rc0)
 }
 
+// int sqlite3_bind_null(sqlite3_stmt*, int);
+func (s *stmt) bindNull(stmt uintptr, idx1 int) (err error) {
+	var rc int32
+	if _, err = s.FFI1(
+		bindNull,
+		virtual.Int32Result{&rc},
+		virtual.Ptr(stmt), virtual.Int32(int32(idx1)),
+	); err != nil {
+		return err
+	}
+
+	if rc != bin.XSQLITE_OK {
+		return s.errstr(rc)
+	}
+
+	return nil
+}
+
 // int sqlite3_bind_double(sqlite3_stmt*, int, double);
 func (s *stmt) bindDouble(pstmt uintptr, idx1 int, value float64) (err error) {
 	var rc int32
@@ -823,41 +945,40 @@ func (s *stmt) bind(pstmt uintptr, n int, args []driver.Value) error {
 		return fmt.Errorf("missing arguments: got %v, expected %v", len(args), n)
 	}
 
+	var err error
+
 	for i, v := range args[:n] {
+		if err != nil {
+			return err
+		}
 		switch x := v.(type) {
+		case nil:
+			err = s.bindNull(pstmt, i+1)
 		case int64:
-			if err := s.bindInt64(pstmt, i+1, x); err != nil {
-				return err
-			}
+			err = s.bindInt64(pstmt, i+1, x)
 		case float64:
-			if err := s.bindDouble(pstmt, i+1, x); err != nil {
-				return err
-			}
+			err = s.bindDouble(pstmt, i+1, x)
 		case bool:
 			v := 0
 			if x {
 				v = 1
 			}
-			if err := s.bindInt(pstmt, i+1, v); err != nil {
-				return err
-			}
+			err = s.bindInt(pstmt, i+1, v)
 		case []byte:
-			if err := s.bindBlob(pstmt, i+1, x); err != nil {
-				return err
-			}
+			err = s.bindBlob(pstmt, i+1, x)
 		case string:
-			if err := s.bindText(pstmt, i+1, x); err != nil {
-				return err
-			}
+			err = s.bindText(pstmt, i+1, x)
 		case time.Time:
-			if err := s.bindText(pstmt, i+1, x.String()); err != nil {
-				return err
+			if s.conn.compatibility {
+				err = s.bindText(pstmt, i+1, x.Format(MattnTimestampFormats[0]))
+			} else {
+				err = s.bindText(pstmt, i+1, x.String())
 			}
 		default:
 			return fmt.Errorf("invalid driver.Value type %T", x)
 		}
 	}
-	return nil
+	return err
 }
 
 // int sqlite3_bind_parameter_count(sqlite3_stmt*);
@@ -993,15 +1114,47 @@ func (t *tx) exec(sql string) (err error) {
 type conn struct {
 	*sqlite
 	*virtual.Thread
-	ppdb uintptr
+	loc           *time.Location
+	compatibility bool
+	ppdb          uintptr
 }
 
 func (c *conn) String() string {
 	return fmt.Sprintf("&%T@%p{sqlite: %p, Thread: %p, ppdb: %#x}", *c, c, c.sqlite, c.Thread, c.ppdb)
 }
 
-func newConn(s *sqlite, name string) (_ *conn, err error) {
+func newConn(s *sqlite, dsn string) (_ *conn, err error) {
 	c := &conn{sqlite: s}
+
+	if !strings.HasPrefix(dsn, "file:") {
+		dsn = "file:" + dsn
+	}
+
+	pos := strings.IndexRune(dsn, '?')
+	if pos >= 1 {
+		params, err := url.ParseQuery(dsn[pos+1:])
+		if err != nil {
+			return nil, err
+		}
+
+		// _mattn
+		_val := params.Get("_mattn")
+		if _val == "true" {
+			c.compatibility = true
+		}
+
+		// _loc (supported only if _mattn)
+		if val := params.Get("_loc"); c.compatibility && val != "" {
+			if val == "auto" {
+				c.loc = time.Local
+			} else {
+				c.loc, err = time.LoadLocation(val)
+				if err != nil {
+					return nil, fmt.Errorf("Invalid _loc: %v: %v", val, err)
+				}
+			}
+		}
+	}
 
 	defer func() {
 		if err != nil {
@@ -1032,7 +1185,7 @@ func newConn(s *sqlite, name string) (_ *conn, err error) {
 	}
 
 	if err = c.openV2(
-		name,
+		dsn,
 		bin.XSQLITE_OPEN_READWRITE|bin.XSQLITE_OPEN_CREATE|
 			bin.XSQLITE_OPEN_FULLMUTEX|
 			bin.XSQLITE_OPEN_URI,
@@ -1311,6 +1464,14 @@ func newDrv() *sqlite { return &sqlite{} }
 // Open may return a cached connection (one previously closed), but doing so is
 // unnecessary; the sql package maintains a pool of idle connections for
 // efficient re-use.
+//
+//
+// we adds the following query parameters to those used by SQLite:
+//   _mattn=true
+//     Ensure we behave compatible to mattn/go-sqlite3
+//   _loc=XXX
+//     Specify location of time format. It's possible to specify "auto".
+//     This parameter is only supported when `_mattn` is enabled.
 //
 // The returned connection is only used by one goroutine at a time.
 func (s *sqlite) Open(name string) (c driver.Conn, err error) {
