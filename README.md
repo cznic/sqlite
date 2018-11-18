@@ -1,9 +1,5 @@
-# sqlite
+`github.com/cznic/sqlite` has moved to [`modernc.org/sqlite`](https://godoc.org/modernc.org/sqlite) ([vcs](https://gitlab.com/cznic/sqlite)).
 
-Package sqlite is an in-process implementation of a self-contained, serverless, zero-configuration, transactional SQL database engine. (Work In Progress)
+Please update your import paths to `modernc.org/sqlite`.
 
-Installation
-
-    $ go get github.com/cznic/sqlite
-
-Documentation: [godoc.org/github.com/cznic/sqlite](http://godoc.org/github.com/cznic/sqlite)
+This repo is now archived.
